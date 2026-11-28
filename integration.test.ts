@@ -51,6 +51,7 @@ test.each([
   const requests: { key?: string; provider: string }[] = [];
   const childInputs: string[] = [];
   const advertised: string[] = [];
+  let spawnDescription: string | undefined;
   let session: AgentSession | undefined;
   async function closeParent() {
     if (!session) return;
@@ -132,8 +133,12 @@ test.each([
         }
         return fauxAssistantMessage("Independent parent work finished");
       }
-      if (JSON.stringify(last).includes(parentPrompt))
+      if (JSON.stringify(last).includes(parentPrompt)) {
+        spawnDescription = ctx.messages
+          .flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : []))
+          .find((t) => t.name === "spawn_agent")?.description;
         return call("spawn_agent", { task_name: "reader", message: task });
+      }
       if (JSON.stringify(last).includes(statusPrompt))
         return call("list_agents", {});
       if (last?.role === "toolResult" && last.toolName === "list_agents")
@@ -204,6 +209,9 @@ test.each([
     parentGate.resolve();
     await prompting;
     await parent.waitForIdle();
+    expect(spawnDescription).toContain(
+      "at most 4 subagents starting or running",
+    );
     expect(requests).toHaveLength(5);
     expect(JSON.stringify(parent.messages)).not.toContain(answer);
     expect(parent.messages.some((m) => m.role === "custom")).toBe(false);

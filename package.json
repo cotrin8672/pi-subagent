@@ -3,7 +3,7 @@
   "license": "MIT",
   "repository": "github:cotrin8672/pi-subagent",
   "scripts": { "test": "bun test" },
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Parent-owned, read-only subagents for Pi and Pig",
   "type": "module",
   "keywords": [
