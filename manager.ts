@@ -28,6 +28,8 @@ interface Entry {
 type Waiter = { runs: Set<string>; finish(row?: Row): void };
 const active = (row: Row) =>
   row.status === "starting" || row.status === "running";
+export const matchesTarget = (row: Row, targets?: readonly string[]) =>
+  !targets || targets.includes(row.agent_id) || targets.includes(row.task_name);
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
@@ -39,7 +41,7 @@ export class Manager {
 
   constructor(
     private readonly onChange: (row: Row) => void,
-    private readonly onCompletion: (row: Row) => void,
+    private readonly unread = new Map<string, Row>(),
   ) {}
 
   list(): Row[] {
@@ -78,8 +80,8 @@ export class Manager {
         claimed = true;
       } else if (!waiter.runs.size) waiter.finish();
     }
+    if (!claimed) this.unread.set(row.run_id, row);
     this.onChange({ ...row });
-    if (!claimed && !this.closing) this.onCompletion({ ...row });
   }
 
   private launch(entry: Entry, child: Child, message: string): Row {
@@ -222,11 +224,15 @@ export class Manager {
   ): Promise<Row | undefined> {
     signal?.throwIfAborted();
     if (this.closing) return;
-    const entries = targets
-      ? targets.map((target) => this.lookup(target))
-      : [...this.agents.values()];
+    for (const [id, row] of this.unread) {
+      if (!matchesTarget(row, targets)) continue;
+      this.unread.delete(id);
+      return { ...row };
+    }
     const runs = new Set(
-      entries.filter((e) => active(e.row)).map((e) => e.row.run_id),
+      [...this.agents.values()]
+        .filter(({ row }) => active(row) && matchesTarget(row, targets))
+        .map(({ row }) => row.run_id),
     );
     if (!runs.size || (timeoutMs !== undefined && timeoutMs <= 0)) return;
     return new Promise((resolve, reject) => {

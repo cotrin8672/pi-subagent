@@ -11,15 +11,10 @@ function pending<T>() {
   return { promise, resolve, reject };
 }
 function fixture() {
-  const changed: Row[] = [],
-    pushed: Row[] = [];
+  const changed: Row[] = [];
   return {
-    m: new Manager(
-      (row) => changed.push(row),
-      (row) => pushed.push(row),
-    ),
+    m: new Manager((row) => changed.push(row)),
     changed,
-    pushed,
   };
 }
 function child() {
@@ -64,24 +59,24 @@ test("slots and names are reserved before startup; parents are independent", asy
 });
 
 test("interrupt during create releases reservation and cleans up a late child", async () => {
-  const { m, pushed } = fixture(),
+  const { m } = fixture(),
     gate = pending<Child>(),
     c = child();
   const started = m.spawn("a", "", () => gate.promise);
   await Promise.resolve();
   const interrupted = await m.interrupt("a");
   expect(await started).toEqual(interrupted);
+  expect(await m.wait(["a"], 0)).toEqual(interrupted);
   await m.spawn("a", "", async () => child());
   gate.resolve(c);
   await m.shutdown();
   expect(c.prompt).not.toHaveBeenCalled();
   expect(c.abort).toHaveBeenCalledTimes(1);
   expect(c.dispose).toHaveBeenCalledTimes(1);
-  expect(pushed).toEqual([interrupted]);
 });
 
 test("one waiter claims a run; steer and followup use the same session", async () => {
-  const { m, pushed } = fixture(),
+  const { m } = fixture(),
     c = child();
   const row = await m.spawn("a", "start", async () => c);
   expect(await m.send(row.agent_id, "hint")).toEqual(row);
@@ -95,7 +90,6 @@ test("one waiter claims a run; steer and followup use the same session", async (
   });
   expect(await second).toBeUndefined();
   expect(await m.wait()).toBeUndefined();
-  expect(pushed).toEqual([]);
   const next = pending<string>();
   c.prompt.mockImplementation(() => next.promise);
   const follow = await m.send("a", "more");
@@ -107,14 +101,49 @@ test("one waiter claims a run; steer and followup use the same session", async (
   });
   expect(follow.final_response).toBeUndefined();
   next.reject(new Error("provider"));
-  await Promise.resolve();
-  expect(pushed).toEqual([{ ...follow, status: "failed", error: "provider" }]);
+  expect(await m.wait(["a"])).toEqual({
+    ...follow,
+    status: "failed",
+    error: "provider",
+  });
   await expect(m.send("a", "retry")).rejects.toThrow("failed");
   await m.shutdown();
 });
 
+test("a poll collects only matching unread runs, even after the child starts another task", async () => {
+  const { m } = fixture();
+  const c = child();
+  const other = child();
+  const first = await m.spawn("a", "", async () => c);
+  const second = await m.spawn("b", "", async () => other);
+  expect(await m.wait(undefined, 0)).toBeUndefined();
+  c.turn.resolve("first result");
+  other.turn.resolve("other result");
+  await Promise.resolve();
+  const next = pending<string>();
+  c.prompt.mockImplementation(() => next.promise);
+  const follow = await m.send("a", "next task");
+  expect(await m.wait([second.agent_id], 0)).toMatchObject({
+    run_id: second.run_id,
+    final_response: "other result",
+  });
+  expect(await m.wait(["a"], 0)).toMatchObject({
+    run_id: first.run_id,
+    final_response: "first result",
+  });
+  expect(await m.wait(undefined, 0)).toBeUndefined();
+  const waiting = m.wait(["a"]);
+  next.resolve("next result");
+  expect(await waiting).toMatchObject({
+    run_id: follow.run_id,
+    final_response: "next result",
+  });
+  expect(await m.wait()).toBeUndefined();
+  await m.shutdown();
+});
+
 test("timeout and signal release only the waiter; interrupt wins over late settlement", async () => {
-  const { m, pushed } = fixture(),
+  const { m } = fixture(),
     c = child();
   await m.spawn("a", "", async () => c);
   const controller = new AbortController();
@@ -129,13 +158,14 @@ test("timeout and signal release only the waiter; interrupt wins over late settl
   const stopped = m.interrupt("a");
   c.turn.resolve("late");
   expect(await stopped).toMatchObject({ status: "interrupted" });
-  expect(pushed).toEqual([await m.interrupt("a")]);
+  expect(await m.wait(["a"], 0)).toEqual(await stopped);
+  expect(await m.wait(["a"], 0)).toBeUndefined();
   await m.shutdown();
   expect(c.dispose).toHaveBeenCalledTimes(1);
 });
 
 test("shutdown wakes waiters, closes admission and suppresses late callbacks", async () => {
-  const { m, changed, pushed } = fixture(),
+  const { m, changed } = fixture(),
     c = child(),
     gate = pending<Child>(),
     late = child();
@@ -158,11 +188,11 @@ test("shutdown wakes waiters, closes admission and suppresses late callbacks", a
   for (const handle of [late, c])
     expect(handle.dispose).toHaveBeenCalledTimes(1);
   expect(changed).toHaveLength(count);
-  expect(pushed).toEqual([]);
+  expect(await m.wait()).toBeUndefined();
 });
 
 test("spawn signal cancels only startup, and skips creation if aborted before admission", async () => {
-  const { m, pushed } = fixture();
+  const { m } = fixture();
   const controller = new AbortController();
   const gate = pending<Child>(),
     create = mock(() => gate.promise);
@@ -175,6 +205,7 @@ test("spawn signal cancels only startup, and skips creation if aborted before ad
   );
   expect(create).toHaveBeenCalledTimes(1);
   gate.reject(new Error("too late"));
+  expect(await m.wait(["a"], 0)).toEqual(await startup);
+  expect(await m.wait(undefined, 0)).toBeUndefined();
   await m.shutdown();
-  expect(pushed).toHaveLength(1);
 });
