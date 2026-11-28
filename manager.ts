@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+export const MAX_ACTIVE_AGENTS = 4;
+
 export interface Child {
   id: string;
   prompt(text: string): Promise<string>;
@@ -57,7 +59,10 @@ export class Manager {
 
   private checkCapacity() {
     if (this.closing) throw new Error("manager shut down");
-    if ([...this.agents.values()].filter((e) => active(e.row)).length >= 4)
+    if (
+      [...this.agents.values()].filter((e) => active(e.row)).length >=
+      MAX_ACTIVE_AGENTS
+    )
       throw new Error("capacity");
   }
 

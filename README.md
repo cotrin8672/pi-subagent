@@ -3,10 +3,10 @@
 同じ Pi profile の Pig と Pi CLI で使える、読み取り専用のサブエージェント。インストール・更新は次のコマンドを実行し、対象のチャットをリロードする。
 
 ```sh
-pi install git:github.com/cotrin8672/pi-subagent@v1.1.0
+pi install git:github.com/cotrin8672/pi-subagent@v1.1.1
 ```
 
-`v1.0.0` をインストール済みの場合も、上のコマンドで参照先が切り替わる。`pi update --extensions` だけでは固定されたタグは変わらない。既存の `@ogulcancelik/pi-codex-subagents` とはツール名が重なるため、同時に有効化しない。
+旧版をインストール済みの場合も、上のコマンドで参照先が切り替わる。`pi update --extensions` だけでは固定されたタグは変わらない。既存の `@ogulcancelik/pi-codex-subagents` とはツール名が重なるため、同時に有効化しない。
 
 親に「AとBを別々のサブエージェントで調べて」と依頼すると、各子が独立した会話で作業する。子には必要な前提を依頼文に含める。親は待たずに作業を続けられ、必要になったら `wait_agent` で結果を取得する。子が完了しても親の会話にメッセージは追加されず、親のモデルも起動しない。
 

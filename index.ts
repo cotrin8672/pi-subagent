@@ -5,7 +5,12 @@ import type {
 import { Type } from "typebox";
 import { createChild } from "./child.ts";
 import { peekChild } from "./history.ts";
-import { Manager, matchesTarget, type Row } from "./manager.ts";
+import {
+  MAX_ACTIVE_AGENTS,
+  Manager,
+  matchesTarget,
+  type Row,
+} from "./manager.ts";
 
 const stateEntry = "pig-subagent-state";
 const waitTool = "wait_agent";
@@ -104,8 +109,7 @@ export default function subagents(pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn agent",
-    description:
-      "Delegate a self-contained read-only task and return once accepted. Continue independent work, then use wait_agent to collect the result before reporting on the delegated task. Results are never sent automatically.",
+    description: `Delegate a self-contained read-only task and return once accepted. Each parent can have at most ${MAX_ACTIVE_AGENTS} subagents starting or running at once; additional spawns are rejected, not queued. Continue independent work, then use wait_agent to collect the result before reporting on the delegated task. Results are never sent automatically.`,
     parameters: Type.Object({
       task_name: Type.String({ minLength: 1, maxLength: 100 }),
       message: text,
