@@ -28,22 +28,39 @@ const toolNames = [
 const call = (name: string, args: Record<string, unknown>) =>
   fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 
-test("installed extension delegates reads through parent policy and resumes the idle parent exactly once", async () => {
+test.each([
+  "idle",
+  "busy",
+])("subagent results stay unread when the parent is %s", async (parentState) => {
   const root = await mkdtemp(join(tmpdir(), "pig-subagent-sdk-"));
   const cwd = join(root, "workspace");
   const agentDir = join(root, "profile");
   const provider = "fixture-selected-account";
   const apiKey = "session-only-key";
   const parentPrompt = "PARENT-ONLY: delegate the fixture check";
+  const statusPrompt = "Check agent status only";
+  const pollPrompt = "Poll for a result";
   const task = "Check the two fixture files";
   const publicData = "permitted fixture bytes";
   const privateData = "restricted fixture bytes";
+  const answer = "Verified read and denial";
   const gate = Promise.withResolvers<void>();
-  const resumed = Promise.withResolvers<void>();
+  const parentStarted = Promise.withResolvers<void>();
+  const parentGate = Promise.withResolvers<void>();
+  const completed = Promise.withResolvers<void>();
   const requests: { key?: string; provider: string }[] = [];
   const childInputs: string[] = [];
   const advertised: string[] = [];
   let session: AgentSession | undefined;
+  async function closeParent() {
+    if (!session) return;
+    await session.extensionRunner.emit({
+      type: "session_shutdown",
+      reason: "quit",
+    });
+    session.dispose();
+    session = undefined;
+  }
   try {
     await mkdir(cwd);
     await mkdir(agentDir);
@@ -77,8 +94,6 @@ test("installed extension delegates reads through parent policy and resumes the 
         },
       ],
     });
-    await loader.reload();
-    expect(loader.getExtensions().errors).toEqual([]);
     const faux = fauxProvider({ provider, tokensPerSecond: Infinity });
     const selectedAuth = join(root, "selected-account.json");
     for (const [path, key] of [
@@ -110,10 +125,23 @@ test("installed extension delegates reads through parent policy and resumes the 
     const respond: FauxResponseFactory = async (ctx, opts, _state, model) => {
       requests.push({ key: opts?.apiKey, provider: model.provider });
       const last = ctx.messages.at(-1);
-      if (last?.role === "toolResult" && last.toolName === "spawn_agent")
+      if (last?.role === "toolResult" && last.toolName === "spawn_agent") {
+        if (parentState === "busy") {
+          parentStarted.resolve();
+          await parentGate.promise;
+        }
         return fauxAssistantMessage("Independent parent work finished");
+      }
       if (JSON.stringify(last).includes(parentPrompt))
         return call("spawn_agent", { task_name: "reader", message: task });
+      if (JSON.stringify(last).includes(statusPrompt))
+        return call("list_agents", {});
+      if (last?.role === "toolResult" && last.toolName === "list_agents")
+        return fauxAssistantMessage("Checked status");
+      if (JSON.stringify(last).includes(pollPrompt))
+        return call("wait_agent", { targets: ["reader"], timeout_ms: 0 });
+      if (last?.role === "toolResult" && last.toolName === "wait_agent")
+        return fauxAssistantMessage("Checked the wait result");
       if (last?.role === "user" && JSON.stringify(last).includes(task)) {
         childInputs.push(JSON.stringify(ctx));
         for (const message of ctx.messages) {
@@ -131,34 +159,55 @@ test("installed extension delegates reads through parent policy and resumes the 
           last.isError &&
           JSON.stringify(last).includes("fixture read denied")
         )
-          return fauxAssistantMessage("Verified read and denial");
-      }
-      if (JSON.stringify(last).includes("Verified read and denial")) {
-        resumed.resolve();
-        return fauxAssistantMessage("Completion acknowledged");
+          return fauxAssistantMessage(answer);
       }
       throw Error(`Unexpected provider input: ${JSON.stringify(last)}`);
     };
-    faux.setResponses(Array.from({ length: 6 }, () => respond));
+    faux.setResponses(Array.from({ length: 11 }, () => respond));
     const sessionManager = SessionManager.create(
       cwd,
       join(agentDir, "sessions"),
     );
-    ({ session } = await createAgentSession({
-      cwd,
-      agentDir,
-      modelRuntime,
-      model: faux.getModel(),
-      tools: ["read", ...toolNames],
-      resourceLoader: loader,
-      settingsManager,
-      sessionManager,
-    }));
-    await session.bindExtensions({});
+    async function openParent(manager: SessionManager) {
+      await loader.reload();
+      expect(loader.getExtensions().errors).toEqual([]);
+      const { session } = await createAgentSession({
+        cwd,
+        agentDir,
+        modelRuntime,
+        model: faux.getModel(),
+        tools: ["read", ...toolNames],
+        resourceLoader: loader,
+        settingsManager,
+        sessionManager: manager,
+      });
+      await session.bindExtensions({});
+      return session;
+    }
+    const parent = await openParent(sessionManager);
+    session = parent;
     for (const name of toolNames)
-      expect(session.getActiveToolNames()).toContain(name);
-    await session.prompt(parentPrompt);
-    const spawn = session.messages.find(
+      expect(parent.getActiveToolNames()).toContain(name);
+    parent.subscribe((event) => {
+      if (
+        event.type === "entry_appended" &&
+        event.entry.type === "custom" &&
+        event.entry.customType === "pig-subagent-state" &&
+        (event.entry.data as { status: string }).status === "completed"
+      )
+        completed.resolve();
+    });
+    const prompting = parent.prompt(parentPrompt);
+    await (parentState === "busy" ? parentStarted.promise : prompting);
+    gate.resolve();
+    await completed.promise;
+    parentGate.resolve();
+    await prompting;
+    await parent.waitForIdle();
+    expect(requests).toHaveLength(5);
+    expect(JSON.stringify(parent.messages)).not.toContain(answer);
+    expect(parent.messages.some((m) => m.role === "custom")).toBe(false);
+    const spawn = parent.messages.find(
       (m) => m.role === "toolResult" && m.toolName === "spawn_agent",
     );
     expect(spawn).toMatchObject({
@@ -171,59 +220,62 @@ test("installed extension delegates reads through parent policy and resumes the 
       run_id: string;
       child_session_id: string;
     };
-    expect(session.messages.some((m) => m.role === "custom")).toBe(false);
-    gate.resolve();
-    await Promise.race([
-      resumed.promise,
-      new Promise<void>((_, reject) => {
-        const timer = setTimeout(
-          () =>
-            reject(
-              Error(
-                `Parent did not resume: ${JSON.stringify(session?.messages.slice(-2))}`,
-              ),
-            ),
-          5000,
-        );
-        timer.unref();
-        resumed.promise.then(() => clearTimeout(timer));
-      }),
-    ]);
-    await session.waitForIdle();
+    const ref = { ...ids, status: "completed" };
+    // Even the next ordinary prompt and status lookup must not see the answer.
+    await parent.prompt(statusPrompt);
+    expect(
+      parent.messages.find(
+        (m) => m.role === "toolResult" && m.toolName === "list_agents",
+      ),
+    ).toMatchObject({
+      isError: false,
+      details: [{ ...ref, task_name: "reader" }],
+    });
+    expect(JSON.stringify(parent.messages)).not.toContain(answer);
+    const file = sessionManager.getSessionFile();
+    if (!file) throw Error("Expected persistent parent session");
+    await closeParent();
+    session = await openParent(SessionManager.open(file));
+    await session.prompt(pollPrompt);
+    expect(
+      session.messages.find(
+        (m) => m.role === "toolResult" && m.toolName === "wait_agent",
+      ),
+    ).toMatchObject({
+      isError: false,
+      details: { ...ref, final_response: answer },
+    });
+    await closeParent();
+    session = await openParent(SessionManager.open(file));
+    await session.prompt(pollPrompt);
+    const waits = session.messages.filter(
+      (m) => m.role === "toolResult" && m.toolName === "wait_agent",
+    );
+    expect(waits).toHaveLength(2);
+    expect(waits[1]).toMatchObject({
+      isError: false,
+      details: { received: false },
+    });
     expect(denied).toEqual(["private.txt"]);
     expect(childInputs).toHaveLength(3);
     expect(advertised).toEqual(["read"]);
     expect(childInputs.join("\n")).not.toContain(parentPrompt);
     expect(childInputs.join("\n")).not.toContain(privateData);
-    expect(requests).toEqual(Array(6).fill({ key: apiKey, provider }));
+    expect(requests).toEqual(Array(11).fill({ key: apiKey, provider }));
     expect(
       session.messages.filter(
         (m) => m.role === "toolResult" && m.toolName === "read",
       ),
     ).toHaveLength(0);
-    await session.extensionRunner.emit({
-      type: "session_shutdown",
-      reason: "quit",
-    });
-    session.dispose();
-    session = undefined;
+    await closeParent();
     expect(modelRuntime.getRegisteredNativeProvider(provider)).toBeDefined();
-    const file = sessionManager.getSessionFile();
-    if (!file) throw Error("Expected persistent parent session");
     const entries = SessionManager.open(file).getBranch();
     const completions = entries.filter(
       (e) =>
         e.type === "custom_message" &&
         e.customType === "pig-subagent-completion",
     );
-    expect(completions).toHaveLength(1);
-    const ref = {
-      agent_id: ids.agent_id,
-      run_id: ids.run_id,
-      child_session_id: ids.child_session_id,
-      status: "completed",
-    };
-    expect(completions[0]).toMatchObject({ details: ref });
+    expect(completions).toHaveLength(0);
     expect(entries).toContainEqual(
       expect.objectContaining({
         type: "custom",
@@ -240,25 +292,15 @@ test("installed extension delegates reads through parent policy and resumes the 
       sessionManager.getSessionId(),
       ids.child_session_id,
     );
-    for (const text of [
-      task,
-      publicData,
-      "fixture read denied",
-      "Verified read and denial",
-    ])
+    for (const text of [task, publicData, "fixture read denied", answer])
       expect(transcript).toContain(text);
     for (const text of [privateData, parentPrompt, apiKey])
       expect(transcript).not.toContain(text);
     expect(await readFile(file, "utf8")).not.toContain(apiKey);
   } finally {
     gate.resolve();
-    if (session) {
-      await session.extensionRunner.emit({
-        type: "session_shutdown",
-        reason: "quit",
-      });
-      session.dispose();
-    }
+    parentGate.resolve();
+    await closeParent();
     await rm(root, { recursive: true, force: true });
   }
 }, 30_000);

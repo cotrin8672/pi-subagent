@@ -5,14 +5,22 @@ import type {
 import { Type } from "typebox";
 import { createChild } from "./child.ts";
 import { peekChild } from "./history.ts";
-import { Manager, type Row } from "./manager.ts";
+import { Manager, matchesTarget, type Row } from "./manager.ts";
 
 const stateEntry = "pig-subagent-state";
+const waitTool = "wait_agent";
 const text = Type.String({ minLength: 1 });
 const result = <T>(details: T) => ({
   content: [{ type: "text" as const, text: JSON.stringify(details) }],
   details,
 });
+const statusOnly = ({
+  agent_id,
+  task_name,
+  run_id,
+  child_session_id,
+  status,
+}: Row) => ({ agent_id, task_name, run_id, child_session_id, status });
 
 export default function subagents(pi: ExtensionAPI) {
   // Per extension instance, not per process. Two Pig chats can share a PID.
@@ -26,49 +34,51 @@ export default function subagents(pi: ExtensionAPI) {
     if (manager) throw Error("Subagent owner changed without shutdown");
     owner = parentId;
     history.clear();
+    const unread = new Map<string, Row>();
     for (const entry of ctx.sessionManager.getBranch()) {
+      if (
+        entry.type === "message" &&
+        entry.message.role === "toolResult" &&
+        entry.message.toolName === waitTool &&
+        !entry.message.isError
+      ) {
+        const runId = (entry.message.details as Partial<Row> | undefined)
+          ?.run_id;
+        if (runId) unread.delete(runId);
+        continue;
+      }
       if (entry.type !== "custom" || entry.customType !== stateEntry) continue;
       const saved = entry.data as Row & {
         parentSessionId?: string;
         version?: number;
+        delivery?: "pull";
       };
       if (
         saved?.version !== 1 ||
         saved.parentSessionId !== parentId ||
-        !saved.agent_id
+        !saved.agent_id ||
+        !saved.run_id
       )
         continue;
-      history.set(
-        saved.agent_id,
-        saved.status === "starting" || saved.status === "running"
-          ? { ...saved, status: "interrupted" }
-          : saved,
-      );
+      const { final_response, error } = saved;
+      const row = { ...statusOnly(saved), final_response, error };
+      if (row.status === "starting" || row.status === "running")
+        row.status = "interrupted";
+      // Results from the old push implementation are history, not unread work.
+      else if (saved.delivery === "pull") unread.set(row.run_id, row);
+      history.set(row.agent_id, row);
     }
-    const local = new Manager(
-      (row) => {
-        if (manager !== local) return;
-        history.set(row.agent_id, row);
-        pi.appendEntry(stateEntry, {
-          ...row,
-          version: 1,
-          parentSessionId: parentId,
-        });
-        pi.events.emit("pig:subagents:changed", { parentId });
-      },
-      (row) => {
-        if (manager !== local) return;
-        pi.sendMessage(
-          {
-            customType: "pig-subagent-completion",
-            display: true,
-            content: `${row.task_name}: ${row.status}\n${row.final_response ?? row.error ?? ""}`,
-            details: { ...row, agent_name: row.task_name },
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-      },
-    );
+    const local = new Manager((row) => {
+      if (manager !== local) return;
+      history.set(row.agent_id, row);
+      pi.appendEntry(stateEntry, {
+        ...row,
+        version: 1,
+        parentSessionId: parentId,
+        delivery: "pull",
+      });
+      pi.events.emit("pig:subagents:changed", { parentId });
+    }, unread);
     manager = local;
     return local;
   }
@@ -89,26 +99,25 @@ export default function subagents(pi: ExtensionAPI) {
       reply?: (rows: Row[]) => void;
     } | null;
     if (manager && req?.parentId === owner && typeof req?.reply === "function")
-      req.reply([...history.values()]);
+      req.reply([...history.values()].map(statusOnly));
   });
   pi.registerTool({
     name: "spawn_agent",
     label: "Spawn agent",
     description:
-      "Delegate a self-contained read-only task in this workspace. Returns once accepted; completion arrives automatically. Continue independent work.",
+      "Delegate a self-contained read-only task and return once accepted. Continue independent work, then use wait_agent to collect the result before reporting on the delegated task. Results are never sent automatically.",
     parameters: Type.Object({
       task_name: Type.String({ minLength: 1, maxLength: 100 }),
       message: text,
     }),
     async execute(_id, { task_name, message }, signal, _update, ctx) {
-      return result(
-        await start(ctx).spawn(
-          task_name,
-          message,
-          () => createChild(ctx, pi, ctx.sessionManager.getSessionId()),
-          signal,
-        ),
+      const row = await start(ctx).spawn(
+        task_name,
+        message,
+        () => createChild(ctx, pi, ctx.sessionManager.getSessionId()),
+        signal,
       );
+      return result(row.child_session_id ? statusOnly(row) : row);
     },
   });
   pi.registerTool({
@@ -118,14 +127,14 @@ export default function subagents(pi: ExtensionAPI) {
       "Steer a running child or give a completed child another task in the same conversation.",
     parameters: Type.Object({ target: text, message: text }),
     async execute(_id, { target, message }, _signal, _update, ctx) {
-      return result(await start(ctx).send(target, message));
+      return result(statusOnly(await start(ctx).send(target, message)));
     },
   });
   pi.registerTool({
-    name: "wait_agent",
+    name: waitTool,
     label: "Wait for agent",
     description:
-      "Wait for one outstanding result when blocked. Timeout or cancelling this wait does not stop any child.",
+      "Collect one unread subagent result. Return immediately if ready, otherwise wait for a matching active run. Set timeout_ms: 0 to poll without waiting. Cancelling or timing out does not stop any child.",
     parameters: Type.Object({
       targets: Type.Optional(Type.Array(text)),
       timeout_ms: Type.Optional(
@@ -133,25 +142,13 @@ export default function subagents(pi: ExtensionAPI) {
       ),
     }),
     async execute(_id, { targets, timeout_ms }, signal, _update, ctx) {
-      const local = start(ctx);
-      const claim = await local.wait(targets, timeout_ms, signal);
+      const claim = await start(ctx).wait(targets, timeout_ms, signal);
       return result(
         claim ?? {
           received: false,
-          agents: local
-            .list()
-            .filter(
-              (r) =>
-                !targets ||
-                targets.includes(r.agent_id) ||
-                targets.includes(r.task_name),
-            )
-            .map(({ agent_id, task_name, run_id, status }) => ({
-              agent_id,
-              task_name,
-              run_id,
-              status,
-            })),
+          agents: [...history.values()]
+            .filter((row) => matchesTarget(row, targets))
+            .map(statusOnly),
         },
       );
     },
@@ -162,27 +159,18 @@ export default function subagents(pi: ExtensionAPI) {
     description: "Stop one child owned by this parent.",
     parameters: Type.Object({ target: text }),
     async execute(_id, { target }, _signal, _update, ctx) {
-      return result(await start(ctx).interrupt(target));
+      return result(statusOnly(await start(ctx).interrupt(target)));
     },
   });
   pi.registerTool({
     name: "list_agents",
     label: "List agents",
-    description: "List this parent's children and their current states.",
+    description:
+      "List this parent's children and their status only. Use wait_agent to read an unread result.",
     parameters: Type.Object({}),
     async execute(_id, _args, _signal, _update, ctx) {
       start(ctx);
-      return result(
-        [...history.values()].map(
-          ({ agent_id, task_name, run_id, status, final_response, error }) => ({
-            agent_id,
-            task_name,
-            run_id,
-            status,
-            summary: (final_response ?? error)?.slice(0, 250),
-          }),
-        ),
-      );
+      return result([...history.values()].map(statusOnly));
     },
   });
   pi.registerCommand("agents", {
